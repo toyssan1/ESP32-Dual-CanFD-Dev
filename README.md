@@ -1,5 +1,7 @@
 # ESP32-S3 Dual CAN-FD Development Board
 
+![ESP32 Dual CAN-FD Dev Board v1](hardware/v1/ESP32-Dual-CanFD-Dev-v1.png)
+
 An ESP32-S3-based development board featuring dual CAN bus interfaces (TWAI + SPI MCP2517FD), a 6-axis IMU, magnetometer compass, OLED display, SD card logging, and an addressable RGB status LED.
 
 ## Features
