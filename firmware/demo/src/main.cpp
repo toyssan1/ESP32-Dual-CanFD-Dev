@@ -6,12 +6,20 @@
 #include <Arduino_BMI270_BMM150.h>
 #include <SparkFun_MMC5983MA_Arduino_Library.h>
 #include <Adafruit_SSD1306.h>
+#include <TinyGPSPlus.h>
 #include "led.h"
 
 // -------------------- CAN (TWAI + SPI MCP2517FD) --------------------
 
 static const uint8_t PIN_TWAI_TX = 18;
 static const uint8_t PIN_TWAI_RX = 17;
+
+// -------------------- NEO-6M GPS (UART1) --------------------
+
+static const uint8_t  PIN_GPS_TX  = 43;   // TXD0 (ESP TX → GPS RX)
+static const uint8_t  PIN_GPS_RX  = 44;   // RXD0 (GPS TX → ESP RX)
+static const uint32_t GPS_BAUD    = 9600;
+static const uint32_t GPS_PRINT_INTERVAL_MS = 1000;
 
 static const uint8_t PIN_SPI_MISO = 10;
 static const uint8_t PIN_SPI_MOSI = 11;
@@ -32,6 +40,7 @@ static const uint8_t PIN_DEMO_SPI_ENABLE = 5;
 static const uint8_t PIN_BMI_ENABLE = 6;
 static const uint8_t PIN_MMC_ENABLE = 15;
 static const uint8_t PIN_CAL_MODE = 16;
+static const uint8_t PIN_SCREEN_CYCLE = 40;
 
 static const uint32_t CAN_SPI_BITRATE = 500000;
 static const uint32_t CAN_TWAI_BITRATE = 500;
@@ -67,6 +76,7 @@ static uint32_t spiDemoSkippedOffline = 0;
 
 static const uint32_t BMI270_POLL_INTERVAL_MS = 50;
 static const uint32_t MMC5983MA_POLL_INTERVAL_MS = 100;
+static const uint32_t MMC5983MA_LOG_INTERVAL_MS  = 500;  // 2 Hz serial/SD logging
 static const uint8_t  MMC5983MA_I2C_ADDR = 0x30;
 static const uint8_t  MMC5983MA_PRODUCT_ID = 0x30;
 static const uint8_t  MMC5983MA_REG_PRODUCT_ID = 0x2F;
@@ -83,6 +93,7 @@ static const float LED_BRIGHTNESS_FILTER_ALPHA = 0.30f; // higher = snappier bri
 static bool bmiOnline = false;
 static bool bmiHasBaseline = false;
 static bool bmiGateWasEnabled = false;
+static uint32_t nextBmiReinitMs = 0;
 static bool ledStartupDemoActive = true;
 static bool ledCurrentlyOff = false;
 static uint32_t nextBmiPollMs = 0;
@@ -91,6 +102,9 @@ static uint32_t directionEventUntilMs = 0;
 static float lastAx = 0.0f;
 static float lastAy = 0.0f;
 static float lastAz = 0.0f;
+static float gravAx = 0.0f;   // gravity baseline captured at first reading
+static float gravAy = 0.0f;
+static float gravAz = 0.0f;
 static float lastAccelMagnitude = 1.0f;
 static float lastDirectionAxis = 0.0f;
 static bool motionFilterReady = false;
@@ -106,8 +120,10 @@ static SFE_MMC5983MA magMMC;
 static bool mmcOnline = false;
 static bool mmcGateWasEnabled = false;
 static uint32_t nextMmcPollMs = 0;
+static uint32_t nextMmcLogMs  = 0;
 static uint32_t nextMmcReinitMs = 0;
 static const uint32_t MMC5983MA_REINIT_INTERVAL_MS = 2000;
+static const uint32_t BMI270_REINIT_INTERVAL_MS    = 2000;
 // MotionCal calibration stream: 100 Hz, mag in µT * 10, accel in m/s² * 100
 // MMC5983MA: 18-bit, ±8 Gauss = ±800 µT, centred at 131072
 static const float   MMC_UT_PER_COUNT = 800.0f / 131072.0f;
@@ -117,10 +133,27 @@ static uint32_t nextCalTxMs  = 0;
 static Adafruit_SSD1306 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
 static bool oledOnline = false;
 
+enum OledScreen : uint8_t { SCREEN_COMPASS = 0, SCREEN_GPS = 1, SCREEN_ACCEL = 2, SCREEN_COUNT = 3 };
+static OledScreen currentScreen = SCREEN_COMPASS;
+static float    lastOledHeading = 0.0f;
+static bool     lastOledHeadingValid = false;
+static bool     screenBtnLastState = true;
+static uint32_t screenBtnDebounceMs = 0;
+static uint32_t nextOledRefreshMs = 0;
+static const uint32_t SCREEN_BTN_DEBOUNCE_MS  = 250;
+static const uint32_t OLED_REFRESH_INTERVAL_MS = 200;
+
 static bool sdOnline = false;
 static File sdLogFile;
 static uint32_t nextSdFlushMs = 0;
 static const uint32_t SD_FLUSH_INTERVAL_MS = 1000;
+
+static TinyGPSPlus gps;
+static uint32_t nextGpsPrintMs = 0;
+static bool     gpsRawDiagActive = false;
+static uint32_t gpsRawDiagEndMs = 0;
+static char     gpsNmeaLineBuf[128];
+static uint8_t  gpsNmeaLineBufPos = 0;
 
 SPIClass spiBus(FSPI);
 ACAN2517FD canSPI(PIN_CAN_CS, spiBus, PIN_CAN_INT);
@@ -146,11 +179,15 @@ static void resetI2CBus() {
   oledOnline = false; // OLED needs reinit after bus reset
 }
 
+static void setupOLED(); // forward declaration — defined below BMI270 setup
+
 static void setupBMI270() {
   resetI2CBus();
   if (!IMU.begin()) {
     bmiOnline = false;
     Serial.println("BMI270 init FAILED");
+    // OLED was killed by resetI2CBus — bring it back even on failure
+    if (!oledOnline) setupOLED();
     return;
   }
 
@@ -158,6 +195,8 @@ static void setupBMI270() {
   bmiHasBaseline = false;
   nextBmiPollMs = millis() + BMI270_POLL_INTERVAL_MS;
   Serial.println("BMI270 init OK (default I2C address)");
+  // OLED was killed by resetI2CBus — bring it back
+  if (!oledOnline) setupOLED();
 }
 
 static void setupOLED() {
@@ -323,6 +362,9 @@ static void serviceBMI270() {
     lastAx = ax;
     lastAy = ay;
     lastAz = az;
+    gravAx = ax;   // capture gravity vector once
+    gravAy = ay;
+    gravAz = az;
     lastAccelMagnitude = sqrtf((ax * ax) + (ay * ay) + (az * az));
     lastDirectionAxis = (fabsf(ax) >= fabsf(ay)) ? ax : ay;
     bmiHasBaseline = true;
@@ -358,7 +400,11 @@ static void serviceBMIGated() {
     }
 
     if (!bmiOnline) {
-      setupBMI270();
+      const uint32_t now = millis();
+      if ((int32_t)(now - nextBmiReinitMs) >= 0) {
+        setupBMI270();
+        nextBmiReinitMs = now + BMI270_REINIT_INTERVAL_MS;
+      }
     }
 
     serviceBMI270();
@@ -374,6 +420,9 @@ static void serviceBMIGated() {
     // Keep sensor powered, but disable polling/reporting until GPIO6 is grounded again.
     bmiOnline = false;
     bmiHasBaseline = false;
+    gravAx = 0.0f;
+    gravAy = 0.0f;
+    gravAz = 0.0f;
     motionFilterReady = false;
     ledRSmoothed = 0.0f;
     ledGSmoothed = 0.0f;
@@ -435,31 +484,143 @@ static const char* headingToCardinal(float deg) {
   return dirs[(uint8_t)((deg + 22.5f) / 45.0f) % 8];
 }
 
-static void updateOLED(float heading, bool valid) {
+// ------------------------------ OLED multi-screen display ------------------------------
+
+static void renderCompassScreen() {
   if (!oledOnline) return;
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
   oled.setTextSize(1);
   oled.setCursor(0, 0);
-  oled.print("COMPASS");
-  if (!valid) {
+  oled.print("COMPASS [1/3]");
+  if (!lastOledHeadingValid) {
     oled.setCursor(0, 28);
     oled.print("-- OFFLINE --");
     oled.display();
     return;
   }
-  char buf[10];
-  snprintf(buf, sizeof(buf), "%.1f", heading);
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%.1f", lastOledHeading);
   oled.setTextSize(2);
-  oled.setCursor(0, 10);
+  oled.setCursor(0, 12);
   oled.print(buf);
   oled.setTextSize(1);
-  oled.setCursor(0, 30);
+  oled.setCursor(80, 14);
   oled.print("deg");
   oled.setTextSize(2);
   oled.setCursor(0, 44);
-  oled.print(headingToCardinal(heading));
+  oled.print(headingToCardinal(lastOledHeading));
   oled.display();
+}
+
+static void renderGpsScreen() {
+  if (!oledOnline) return;
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  char buf[22];
+  if (gps.location.isValid()) {
+    oled.setCursor(0, 0);
+    oled.print("GPS  FIX [2/3]");
+    snprintf(buf, sizeof(buf), "%.5f", gps.location.lat());
+    oled.setCursor(0, 12);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "%.5f", gps.location.lng());
+    oled.setCursor(0, 22);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "Alt:%.0fm", gps.altitude.meters());
+    oled.setCursor(0, 34);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "Sat:%u", gps.satellites.value());
+    oled.setCursor(70, 34);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "%.1fkph", gps.speed.kmph());
+    oled.setCursor(0, 46);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "Crs:%.0f", gps.course.deg());
+    oled.setCursor(70, 46);
+    oled.print(buf);
+  } else {
+    oled.setCursor(0, 0);
+    oled.print("GPS NO FIX [2/3]");
+    snprintf(buf, sizeof(buf), "Sats: %u",
+             gps.satellites.isValid() ? gps.satellites.value() : 0);
+    oled.setCursor(0, 14);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "Chars:%lu", (unsigned long)gps.charsProcessed());
+    oled.setCursor(0, 28);
+    oled.print(buf);
+    snprintf(buf, sizeof(buf), "Fixes:%lu", (unsigned long)gps.sentencesWithFix());
+    oled.setCursor(0, 42);
+    oled.print(buf);
+  }
+  oled.display();
+}
+
+static void renderAccelScreen() {
+  if (!oledOnline) return;
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);
+  oled.print("ACCEL [3/3]");
+  if (!bmiOnline) {
+    oled.setCursor(0, 22);
+    oled.print("-- OFFLINE --");
+    oled.setCursor(0, 34);
+    oled.print("GPIO6=enable");
+    oled.display();
+    return;
+  }
+  char buf[16];
+  const float dx = lastAx - gravAx;
+  const float dy = lastAy - gravAy;
+  const float dz = lastAz - gravAz;
+  snprintf(buf, sizeof(buf), "X:% .3fg", dx);
+  oled.setCursor(0, 14);
+  oled.print(buf);
+  snprintf(buf, sizeof(buf), "Y:% .3fg", dy);
+  oled.setCursor(0, 26);
+  oled.print(buf);
+  snprintf(buf, sizeof(buf), "Z:% .3fg", dz);
+  oled.setCursor(0, 38);
+  oled.print(buf);
+  const float mag = sqrtf((dx * dx) + (dy * dy) + (dz * dz));
+  snprintf(buf, sizeof(buf), "M:% .3fg", mag);
+  oled.setCursor(0, 50);
+  oled.print(buf);
+  oled.display();
+}
+
+static void renderOledCurrentScreen() {
+  if (!oledOnline || calModeActive) return;
+  switch (currentScreen) {
+    case SCREEN_COMPASS: renderCompassScreen(); break;
+    case SCREEN_GPS:     renderGpsScreen();     break;
+    case SCREEN_ACCEL:   renderAccelScreen();   break;
+    default: break;
+  }
+}
+
+static void serviceScreenButton() {
+  const bool currHigh = (digitalRead(PIN_SCREEN_CYCLE) == HIGH);
+  const uint32_t now = millis();
+  // Detect falling edge (was HIGH, now LOW) with debounce
+  if (!currHigh && screenBtnLastState && (int32_t)(now - screenBtnDebounceMs) >= 0) {
+    currentScreen = (OledScreen)((uint8_t)(currentScreen + 1) % SCREEN_COUNT);
+    screenBtnDebounceMs = now + SCREEN_BTN_DEBOUNCE_MS;
+    static const char* const names[] = {"COMPASS", "GPS", "ACCEL"};
+    Serial.printf("OLED screen -> %s\n", names[currentScreen]);
+    renderOledCurrentScreen();
+  }
+  screenBtnLastState = currHigh;
+}
+
+static void serviceOledDisplay() {
+  const uint32_t now = millis();
+  if ((int32_t)(now - nextOledRefreshMs) < 0) return;
+  nextOledRefreshMs = now + OLED_REFRESH_INTERVAL_MS;
+  renderOledCurrentScreen();
 }
 
 static void serviceMMC5983() {
@@ -481,16 +642,18 @@ static void serviceMMC5983() {
   float heading = atan2f(fy, fx) * 180.0f / (float)M_PI;
   if (heading < 0.0f) heading += 360.0f;
 
-  if (sdOnline) {
-    sdLogFile.printf("%lu,MAG,%.2f,%lu,%lu,%lu\n",
-                     (unsigned long)millis(), heading,
-                     (unsigned long)rawX, (unsigned long)rawY, (unsigned long)rawZ);
-  }
+  lastOledHeading = heading;
+  lastOledHeadingValid = true;
 
-  Serial.printf("MMC5983MA heading: %.1f deg  X=%lu Y=%lu Z=%lu\n",
-                heading, (unsigned long)rawX, (unsigned long)rawY, (unsigned long)rawZ);
-  if (!calModeActive) {
-    updateOLED(heading, true);
+  if ((int32_t)(now - nextMmcLogMs) >= 0) {
+    nextMmcLogMs = now + MMC5983MA_LOG_INTERVAL_MS;
+    if (sdOnline) {
+      sdLogFile.printf("%lu,MAG,%.2f,%lu,%lu,%lu\n",
+                       (unsigned long)millis(), heading,
+                       (unsigned long)rawX, (unsigned long)rawY, (unsigned long)rawZ);
+    }
+    Serial.printf("MMC5983MA heading: %.1f deg  X=%lu Y=%lu Z=%lu\n",
+                  heading, (unsigned long)rawX, (unsigned long)rawY, (unsigned long)rawZ);
   }
 }
 
@@ -501,14 +664,7 @@ static void serviceCalMode() {
     if (calModeActive) {
       calModeActive = false;
       Serial.println("CAL MODE OFF — resuming normal output");
-      if (oledOnline) {
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(0, 0);
-        oled.print("COMPASS");
-        oled.display();
-      }
+      renderOledCurrentScreen();
     }
     return;
   }
@@ -573,7 +729,7 @@ static void serviceMMCAlways() {  if (!mmcOnline) {
         setupOLED();
       } else if (!mmcOnline) {
         nextMmcReinitMs = now + MMC5983MA_REINIT_INTERVAL_MS;
-        updateOLED(0.0f, false);
+        lastOledHeadingValid = false;
       }
     }
     return;
@@ -622,6 +778,77 @@ static void serviceSD() {
   if ((int32_t)(now - nextSdFlushMs) >= 0) {
     sdLogFile.flush();
     nextSdFlushMs = now + SD_FLUSH_INTERVAL_MS;
+  }
+}
+
+// ------------------------------ NEO-6M GPS (UART1) ------------------------------
+
+static void setupGPS() {
+  Serial1.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+  gpsRawDiagActive  = true;
+  gpsRawDiagEndMs   = millis() + 10000;
+  gpsNmeaLineBufPos = 0;
+  Serial.printf("NEO-6M GPS init OK (UART1 RX=GPIO%u TX=GPIO%u @ %lu baud)\n",
+                PIN_GPS_RX, PIN_GPS_TX, (unsigned long)GPS_BAUD);
+  Serial.println("GPS: raw NMEA will print for 10s — silence means a wiring problem");
+}
+
+static void serviceGPS() {
+  while (Serial1.available()) {
+    const char c = (char)Serial1.read();
+    gps.encode(c);
+    if (gpsRawDiagActive) {
+      if (c == '\n') {
+        if (gpsNmeaLineBufPos > 0) {
+          gpsNmeaLineBuf[gpsNmeaLineBufPos] = '\0';
+          Serial.printf("[GPS RAW] %s\n", gpsNmeaLineBuf);
+          gpsNmeaLineBufPos = 0;
+        }
+      } else if (c != '\r' && gpsNmeaLineBufPos < (uint8_t)(sizeof(gpsNmeaLineBuf) - 1)) {
+        gpsNmeaLineBuf[gpsNmeaLineBufPos++] = c;
+      }
+    }
+  }
+
+  if (gpsRawDiagActive && (int32_t)(millis() - gpsRawDiagEndMs) >= 0) {
+    gpsRawDiagActive = false;
+    if (gps.charsProcessed() == 0) {
+      Serial.println("GPS WARNING: 0 chars in 10s — check wiring (GPS TX->GPIO2, GPS RX->GPIO1, 3.3V, GND)");
+    } else {
+      Serial.printf("GPS diag done: %lu chars, %lu sentences with fix, %lu bad checksum\n",
+                    (unsigned long)gps.charsProcessed(),
+                    (unsigned long)gps.sentencesWithFix(),
+                    (unsigned long)gps.failedChecksum());
+    }
+  }
+
+  const uint32_t now = millis();
+  if ((int32_t)(now - nextGpsPrintMs) < 0) return;
+  nextGpsPrintMs = now + GPS_PRINT_INTERVAL_MS;
+
+  if (gps.location.isValid()) {
+    Serial.printf("GPS FIX: lat=%.6f lon=%.6f alt=%.1fm speed=%.1fkph course=%.1fdeg sats=%u hdop=%.2f\n",
+                  gps.location.lat(),
+                  gps.location.lng(),
+                  gps.altitude.meters(),
+                  gps.speed.kmph(),
+                  gps.course.deg(),
+                  gps.satellites.value(),
+                  gps.hdop.hdop());
+    if (sdOnline) {
+      sdLogFile.printf("%lu,GPS,%.6f,%.6f,%.1f,%.1f\n",
+                       (unsigned long)millis(),
+                       gps.location.lat(),
+                       gps.location.lng(),
+                       gps.altitude.meters(),
+                       gps.speed.kmph());
+    }
+  } else {
+    Serial.printf("GPS NO FIX: chars=%lu sentences=%lu failed=%lu sats=%u\n",
+                  (unsigned long)gps.charsProcessed(),
+                  (unsigned long)gps.sentencesWithFix(),
+                  (unsigned long)gps.failedChecksum(),
+                  gps.satellites.isValid() ? gps.satellites.value() : 0);
   }
 }
 
@@ -896,6 +1123,7 @@ void setup() {
   pinMode(PIN_DEMO_SPI_ENABLE, INPUT_PULLUP);
   pinMode(PIN_BMI_ENABLE, INPUT_PULLUP);
   pinMode(PIN_CAL_MODE, INPUT_PULLUP);
+  pinMode(PIN_SCREEN_CYCLE, INPUT_PULLUP);
 
   Wire.begin();
 
@@ -905,7 +1133,9 @@ void setup() {
   Serial.println("GPIO5 LOW = enable SPI demo TX");
   Serial.println("GPIO6 LOW = enable BMI270 reporting");
   Serial.println("GPIO16 LOW = enter MotionCal calibration mode");
+  Serial.println("GPIO40 LOW = cycle OLED screen (COMPASS -> GPS -> ACCEL)");
   Serial.println("MMC5983MA + OLED always enabled");
+  Serial.printf("NEO-6M GPS on UART1 RX=GPIO%u TX=GPIO%u\n", PIN_GPS_RX, PIN_GPS_TX);
   Serial.printf("Boot input state: GPIO4=%s GPIO5=%s\n",
                 demoTwaiEnabled() ? "LOW/enabled" : "HIGH/disabled",
                 demoSpiEnabled() ? "LOW/enabled" : "HIGH/disabled");
@@ -919,6 +1149,7 @@ void setup() {
   }
 
   setupSD();
+  setupGPS();
   setupMMC5983();
   setupOLED();
 
@@ -947,6 +1178,9 @@ void loop() {
   serviceBMIGated();
   serviceCalMode();
   serviceMMCAlways();
+  serviceGPS();
+  serviceScreenButton();
+  serviceOledDisplay();
   serviceSD();
 
   delay(1);
